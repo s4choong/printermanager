@@ -4,9 +4,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os/exec"
-	"strconv"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -27,37 +27,38 @@ type Printer struct {
 var cachedPrinters []Printer
 
 func getPrinters() ([]Printer, error) {
-	cmd := exec.Command("powershell", "Get-Printer | Select-Object Name,PortName,DriverName | Format-Table -HideTableHeaders")
+	cmd := exec.Command("powershell", "-Command",
+		`Get-Printer | Select-Object Name,PortName,DriverName | ConvertTo-Json -Compress`)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
 
-	lines := strings.Split(string(out), "\n")
-	printers := []Printer{}
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
+	var raw []map[string]string
+	if err := json.Unmarshal(out, &raw); err != nil {
+		// 只有一个结果时返回 map，不是数组
+		var single map[string]string
+		if err := json.Unmarshal(out, &single); err != nil {
+			return nil, fmt.Errorf("JSON parse failed: %v\nRaw output:\n%s", err, string(out))
 		}
-		name := fields[0]
-		port := fields[1]
-		driver := ""
-		if len(fields) >= 3 {
-			driver = strings.Join(fields[2:], " ")
-		}
+		raw = append(raw, single)
+	}
+
+	var printers []Printer
+	for _, p := range raw {
 		printers = append(printers, Printer{
-			Name:     name,
-			PortName: port,
-			Driver:   driver,
-			OldName:  name,
+			Name:     p["Name"],
+			PortName: p["PortName"],
+			Driver:   p["DriverName"],
+			OldName:  p["Name"],
 		})
 	}
 	return printers, nil
 }
 
 func renamePrinter(oldName, newName string) error {
-	cmd := exec.Command("powershell", "Rename-Printer", "-Name", oldName, "-NewName", newName)
+	cmdText := fmt.Sprintf(`Rename-Printer -Name "%s" -NewName "%s"`, escapeQuotes(oldName), escapeQuotes(newName))
+	cmd := exec.Command("powershell", "-Command", cmdText)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Rename failed: %v\n%s", err, string(out))
@@ -65,12 +66,15 @@ func renamePrinter(oldName, newName string) error {
 	return nil
 }
 
+func escapeQuotes(s string) string {
+	return strings.ReplaceAll(s, `"`, "`\"")
+}
+
 // mimicLabelWithCopy 返回一个 Label + Copy 按钮组合
 func mimicLabelWithCopy(value string, win fyne.Window) fyne.CanvasObject {
 	label := widget.NewLabel(value)
 	copyBtn := widget.NewButton("📋", func() {
-		clip := win.Clipboard()
-		clip.SetContent(value)
+		win.Clipboard().SetContent(value)
 	})
 	copyBtn.Importance = widget.LowImportance
 	copyBtn.Resize(fyne.NewSize(30, 24))
@@ -80,8 +84,8 @@ func mimicLabelWithCopy(value string, win fyne.Window) fyne.CanvasObject {
 func buildPrinterTable(printers []Printer, w fyne.Window) fyne.CanvasObject {
 	rows := []fyne.CanvasObject{}
 
-	title := container.New(layout.NewGridLayout(5),
-		widget.NewLabelWithStyle("Index", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+	// 移除 Index 栏位，只保留这四项
+	title := container.New(layout.NewGridLayout(4),
 		widget.NewLabelWithStyle("New Name", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabelWithStyle("Current Name", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		widget.NewLabelWithStyle("Old Name", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -92,13 +96,11 @@ func buildPrinterTable(printers []Printer, w fyne.Window) fyne.CanvasObject {
 	entryMap := make(map[int]*widget.Entry)
 
 	for i, p := range printers {
-		index := i
 		entry := widget.NewEntry()
 		entry.SetPlaceHolder("New name")
-		entryMap[index] = entry
+		entryMap[i] = entry
 
-		row := container.New(layout.NewGridLayout(5),
-			widget.NewLabel(strconv.Itoa(index)),
+		row := container.New(layout.NewGridLayout(4),
 			entry,
 			mimicLabelWithCopy(p.Name, w),
 			mimicLabelWithCopy(p.OldName, w),
@@ -115,8 +117,7 @@ func buildPrinterTable(printers []Printer, w fyne.Window) fyne.CanvasObject {
 		for i, p := range printers {
 			newName := strings.TrimSpace(entryMap[i].Text)
 			if newName != "" && newName != p.Name {
-				err := renamePrinter(p.Name, newName)
-				if err != nil {
+				if err := renamePrinter(p.Name, newName); err != nil {
 					hasError = true
 					dialog.ShowError(err, w)
 					return
@@ -148,8 +149,7 @@ func buildUI(w fyne.Window) fyne.CanvasObject {
 			}
 		}
 	}
-
-	cachedPrinters = currentPrinters // 更新缓存
+	cachedPrinters = currentPrinters
 	return buildPrinterTable(currentPrinters, w)
 }
 
